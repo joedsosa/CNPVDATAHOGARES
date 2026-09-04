@@ -15,6 +15,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.LinkedHashMap;
+import java.util.Collections;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -210,9 +211,12 @@ public class MainCNPV {
                     drop.executeUpdate("DROP TEMPORARY TABLE IF EXISTS boletas_cambios");
                 }
 
+                // No se trae UNCOMPRESS(questionnaire) en este primer paso: MySQL calcula el
+                // hash internamente sin necesidad de mandar el texto completo a Java. Traer el
+                // cuestionario de TODAS las boletas de la ventana (incluidas las que no cambiaron)
+                // es lo que agotaba la memoria en ventanas grandes.
                 String sqlCreateTemp = "CREATE TEMPORARY TABLE boletas_cambios AS "
                         + "SELECT id, HEX(guid) AS guid, caseids, "
-                        + "UNCOMPRESS(questionnaire) AS questionnaire, "
                         + "MD5(UNCOMPRESS(questionnaire)) AS hash, modified_time "
                         + "FROM csweb.HPHC_HOGARES_DICT "
                         + "WHERE modified_time >= ? AND modified_time < ? "
@@ -225,7 +229,7 @@ public class MainCNPV {
                 }
 
                 Map<String, BeletaInfo> boletasCandidatas = new LinkedHashMap<>();
-                String sqlCandidatas = "SELECT id, guid, caseids, questionnaire, hash, modified_time "
+                String sqlCandidatas = "SELECT id, guid, caseids, hash, modified_time "
                         + "FROM boletas_cambios";
 
                 try (Statement stmt = conOrigen.createStatement();
@@ -234,7 +238,6 @@ public class MainCNPV {
                         BeletaInfo info = new BeletaInfo();
                         info.idCspro = rs.getInt("id");
                         info.guid = rs.getString("guid");
-                        info.questionnaire = rs.getString("questionnaire");
                         info.hash = rs.getString("hash");
                         info.caseids = rs.getString("caseids");
                         info.sourceModifiedTime = rs.getTimestamp("modified_time");
@@ -310,6 +313,46 @@ public class MainCNPV {
                     actualizarUltimaSincronizacion(conReplica, syncHasta);
                     System.out.println("No había cambios de contenido. Ciclo confirmado.");
                     continue;
+                }
+
+                // Traer el cuestionario completo (UNCOMPRESS) solo para las boletas que
+                // realmente van a procesarse. En ventanas grandes esto es una fracción
+                // pequeña del total, así que ya no se satura la memoria con boletas que
+                // se iban a descartar de todas formas por hash igual.
+                Map<String, BeletaInfo> aProcesarPorGuid = new HashMap<>();
+                for (BeletaInfo info : boletasAProcesar) {
+                    aProcesarPorGuid.put(info.guid, info);
+                }
+
+                List<String> guidsAProcesar = new ArrayList<>(aProcesarPorGuid.keySet());
+                final int loteQuestionnaire = 500;
+
+                for (int inicio = 0; inicio < guidsAProcesar.size(); inicio += loteQuestionnaire) {
+                    List<String> lote = guidsAProcesar.subList(
+                            inicio, Math.min(inicio + loteQuestionnaire, guidsAProcesar.size())
+                    );
+
+                    String placeholders = String.join(
+                            ",", Collections.nCopies(lote.size(), "?")
+                    );
+                    String sqlQuestionnaire = "SELECT HEX(guid) AS guid, "
+                            + "UNCOMPRESS(questionnaire) AS questionnaire "
+                            + "FROM csweb.HPHC_HOGARES_DICT "
+                            + "WHERE HEX(guid) IN (" + placeholders + ")";
+
+                    try (PreparedStatement stmtQ = conOrigen.prepareStatement(sqlQuestionnaire)) {
+                        for (int i = 0; i < lote.size(); i++) {
+                            stmtQ.setString(i + 1, lote.get(i));
+                        }
+                        try (ResultSet rsQ = stmtQ.executeQuery()) {
+                            while (rsQ.next()) {
+                                BeletaInfo info = aProcesarPorGuid.get(rsQ.getString("guid"));
+                                if (info != null) {
+                                    info.questionnaire = rsQ.getString("questionnaire");
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Para cargas incrementales pequeñas no se deben desactivar índices.
@@ -995,7 +1038,11 @@ public class MainCNPV {
                 }
 
                 JsonObject persona = elemento.getAsJsonObject();
-                int mantenerFila = obtenerEnteroJson(persona, 1, "H_KEEP_ROW");
+                // Si CSPro no envia H_KEEP_ROW (slot del roster nunca visitado), se
+                // asume 2 (borrar) por defecto, no 1. De lo contrario esos slots
+                // vacios se insertan como filas fantasma (edad, sexo, nombre y
+                // orden en blanco) en personas_rec.
+                int mantenerFila = obtenerEnteroJson(persona, 2, "H_KEEP_ROW");
 
                 // En el diccionario: 1 = mantener fila, 2 = borrar fila.
                 if (mantenerFila != 1) {

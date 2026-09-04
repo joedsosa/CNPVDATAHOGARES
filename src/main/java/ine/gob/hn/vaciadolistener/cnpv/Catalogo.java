@@ -157,11 +157,12 @@ public class Catalogo {
         Map<String, String> elimBasuraValores = new HashMap<>();
         elimBasuraValores.put("1", "Recolección domiciliaria (tren de aseo)");
         elimBasuraValores.put("2", "La deposita en contenedores");
-        elimBasuraValores.put("3", "La entierra");
+        elimBasuraValores.put("3", "Paga a particulares para que la boten");
         elimBasuraValores.put("4", "La prepara para abono");
         elimBasuraValores.put("5", "La quema");
-        elimBasuraValores.put("6", "La tira en cualquier lugar");
-        elimBasuraValores.put("7", "Otro");
+        elimBasuraValores.put("6", "La entierra");
+        elimBasuraValores.put("7", "La tira en cualquier lugar");
+        elimBasuraValores.put("8", "Otro");
 
         //Map<String, Map<String, String>> grupoViviendaRec = catalogos.getOrDefault("VIVIENDA_REC", new HashMap<>());
         grupoViviendaRec.put("H_V09_ELIM_BASURA", elimBasuraValores);
