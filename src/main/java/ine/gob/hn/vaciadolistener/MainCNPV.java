@@ -725,6 +725,92 @@ public class MainCNPV {
         }
     }
 
+    // Elimina una boleta completa (tablas hijas + level-1 + registro de sincronización)
+    // identificada por su case-id. A diferencia de borrarDatosHijos (que conserva un
+    // level-1-id por si esa MISMA boleta se va a reprocesar), este método se usa cuando
+    // la boleta queda reemplazada por OTRO case-id distinto y no debe quedar rastro de ella.
+    private static void eliminarBoletaCompleta(Connection con, String guidAEliminar) throws SQLException {
+        borrarDatosHijos(con, guidAEliminar);
+
+        try (PreparedStatement del = con.prepareStatement(
+                "DELETE FROM cnpv_data.`level-1` WHERE `case-id` = ?")) {
+            del.setString(1, guidAEliminar);
+            del.executeUpdate();
+        }
+
+        try (PreparedStatement del = con.prepareStatement(
+                "DELETE FROM cnpv_data.registros_cnpv WHERE uiid_cspro = ?")) {
+            del.setString(1, guidAEliminar);
+            del.executeUpdate();
+        }
+    }
+
+    // Cuando el equipo de campo "corrige" una boleta rehaciendo la entrevista completa
+    // en vez de editarla, CSPro genera un case-id (GUID) nuevo para la misma vivienda/
+    // hogar físico. Para listener1 eso llega como una boleta "nueva" (nunca vio ese
+    // GUID), y sin este chequeo la boleta vieja (con datos/GPS incorrectos) se queda
+    // conviviendo para siempre junto a la nueva, duplicando el conteo de personas y
+    // hogares. Antes de insertar la boleta nueva, se busca si ya existe otra con la
+    // misma llave de hogar (censista+zona+sector+segmento+estructura+vivienda+hogar)
+    // pero un case-id distinto, y si existe, se elimina por completo.
+    private static void reemplazarBoletasDelMismoHogar(
+            Connection con,
+            String guidNuevo,
+            JsonObject identificacion
+    ) throws SQLException {
+        String censista = valorLlaveHogar(identificacion, "L1_COD_ENCUESTADOR");
+        String zona = valorLlaveHogar(identificacion, "L1_ZONA");
+        String sector = valorLlaveHogar(identificacion, "L1_SECTOR");
+        String segmento = valorLlaveHogar(identificacion, "L1_SEGMENTO");
+        String estructura = valorLlaveHogar(identificacion, "L1_ESTRUCTURA");
+        String vivienda = valorLlaveHogar(identificacion, "L1_VIVIENDA");
+        String hogar = valorLlaveHogar(identificacion, "L1_HOGAR");
+
+        // Sin todos los componentes de la llave no se puede comparar con seguridad;
+        // mejor no arriesgarse a borrar boletas que en realidad no son del mismo hogar.
+        if (censista.isEmpty() || zona.isEmpty() || sector.isEmpty() || segmento.isEmpty()
+                || estructura.isEmpty() || vivienda.isEmpty() || hogar.isEmpty()) {
+            return;
+        }
+
+        // l1_hogar_key es una columna GENERATED ALWAYS AS ... STORED en cnpv_data.`level-1`
+        // (mismo patron que l1_depto_norm/l1_zona_norm) que concatena estos mismos 7 campos
+        // normalizados con '|'. Usarla en vez de comparar con TRIM() en cada campo evita un
+        // full table scan de ~1.9M filas por cada boleta procesada (antes no habia forma de
+        // indexar la combinacion de columnas longtext con TRIM()).
+        String llaveHogar = censista + "|" + zona + "|" + sector + "|" + segmento + "|"
+                + estructura + "|" + vivienda + "|" + hogar;
+
+        String sqlBuscar = "SELECT DISTINCT `case-id` FROM cnpv_data.`level-1` "
+                + "WHERE l1_hogar_key = ? AND `case-id` <> ?";
+
+        List<String> guidsViejos = new ArrayList<>();
+
+        try (PreparedStatement stmt = con.prepareStatement(sqlBuscar)) {
+            stmt.setString(1, llaveHogar);
+            stmt.setString(2, guidNuevo);
+
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    guidsViejos.add(rs.getString("case-id"));
+                }
+            }
+        }
+
+        for (String guidViejo : guidsViejos) {
+            System.out.println("Hogar recapturado con nuevo case-id (censista=" + censista
+                    + ", zona=" + zona + ", sector=" + sector + ", segmento=" + segmento
+                    + ", estructura=" + estructura + ", vivienda=" + vivienda + ", hogar=" + hogar
+                    + "): se elimina boleta anterior " + guidViejo + " reemplazada por " + guidNuevo);
+            eliminarBoletaCompleta(con, guidViejo);
+        }
+    }
+
+    private static String valorLlaveHogar(JsonObject identificacion, String nombre) {
+        String valor = obtenerValorJson(identificacion, nombre);
+        return valor == null ? "" : valor.trim();
+    }
+
     private static void procesarBoleta(Connection conReplica, Gson gson, BeletaInfo info) throws SQLException {
         try {
             JsonObject cuestionarioJson = gson.fromJson(info.questionnaire, JsonObject.class);
@@ -740,6 +826,8 @@ public class MainCNPV {
             if (info.caseids == null || info.caseids.trim().isEmpty()) {
                 info.caseids = construirCaseId(identificacion);
             }
+
+            reemplazarBoletasDelMismoHogar(conReplica, info.guid, identificacion);
 
             int levelId = buscarLevelIdPorGuid(conReplica, info.guid);
 
